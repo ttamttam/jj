@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use futures::TryStreamExt as _;
 use itertools::Itertools as _;
@@ -61,6 +61,9 @@ pub(crate) struct StatusArgs {
     /// Restrict the status display to these paths
     #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
+    /// Show ignored files
+    #[arg(long)]
+    ignored: bool,
 }
 
 #[instrument(skip_all)]
@@ -95,7 +98,10 @@ pub(crate) async fn cmd_status(
             [&status.tree],
         )?;
 
-        if !status.has_any_tracked_changes() && !status.has_any_untracked_paths() {
+        if !status.has_any_tracked_changes()
+            && !status.has_any_untracked_paths()
+            && (!args.ignored || !status.has_any_ignored_paths())
+        {
             writeln!(formatter, "The working copy has no changes.")?;
         } else {
             if status.has_any_tracked_changes() {
@@ -146,6 +152,37 @@ pub(crate) async fn cmd_status(
                     },
                 )
                 .await?;
+            }
+
+            if args.ignored {
+                let mut matching_ignored_paths =
+                    status.ignored_paths_matching(&matcher).peekable();
+                if matching_ignored_paths.peek().is_some() {
+                    let workspace_root = workspace_command.workspace_root().to_owned();
+                    writeln!(formatter, "Ignored paths:")?;
+                    visit_collapsed_untracked_files(
+                        matching_ignored_paths,
+                        status.tree.clone(),
+                        |path, _is_dir| {
+                            let ui_path =
+                                workspace_command.path_converter().format_file_path(path);
+                            let is_dir = path
+                                .to_fs_path_unchecked(&workspace_root)
+                                .is_dir();
+                            writeln!(
+                                formatter.labeled("diff").labeled("ignored"),
+                                "I {ui_path}{}",
+                                if is_dir {
+                                    std::path::MAIN_SEPARATOR_STR
+                                } else {
+                                    ""
+                                }
+                            )?;
+                            Ok(())
+                        },
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -255,6 +292,7 @@ struct WorkingCopyStatus {
     parent_tree: MergedTree,
     tree: MergedTree,
     untracked_paths: BTreeMap<RepoPathBuf, UntrackedReason>,
+    ignored_paths: BTreeSet<RepoPathBuf>,
 }
 
 impl WorkingCopyStatus {
@@ -266,9 +304,20 @@ impl WorkingCopyStatus {
         !self.untracked_paths.is_empty()
     }
 
+    fn has_any_ignored_paths(&self) -> bool {
+        !self.ignored_paths.is_empty()
+    }
+
     fn untracked_paths_matching(&self, matcher: &dyn Matcher) -> impl Iterator<Item = &RepoPath> {
         self.untracked_paths
             .keys()
+            .filter(|path| matcher.matches(path))
+            .map(|path| path.as_ref())
+    }
+
+    fn ignored_paths_matching(&self, matcher: &dyn Matcher) -> impl Iterator<Item = &RepoPath> {
+        self.ignored_paths
+            .iter()
             .filter(|path| matcher.matches(path))
             .map(|path| path.as_ref())
     }
@@ -284,6 +333,7 @@ async fn collect_working_copy_status(
     let parent_tree = commit.parent_tree(repo).await?;
     let tree = commit.tree();
     let untracked_paths = snapshot_stats.untracked_paths;
+    let ignored_paths = snapshot_stats.ignored_paths;
 
     Ok(WorkingCopyStatus {
         commit,
@@ -291,6 +341,7 @@ async fn collect_working_copy_status(
         parent_tree,
         tree,
         untracked_paths,
+        ignored_paths,
     })
 }
 

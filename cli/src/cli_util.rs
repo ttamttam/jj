@@ -14,10 +14,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap,BTreeSet,HashMap,HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -713,12 +710,14 @@ impl CommandHelper {
                     let SnapshotStats {
                         mut untracked_paths,
                         mut invalid_utf8_paths,
+                        mut ignored_paths,
                     } = stale_stats;
                     untracked_paths.extend(fresh_stats.untracked_paths);
                     invalid_utf8_paths.extend(fresh_stats.invalid_utf8_paths);
                     SnapshotStats {
                         untracked_paths,
                         invalid_utf8_paths,
+                        ignored_paths
                     }
                 };
                 Ok((workspace_command, merged_stats))
@@ -2166,12 +2165,12 @@ to the current parents may contain changes from multiple commits.
                     crate::git_util::print_git_export_stats(ui, &stats)
                         .map_err(snapshot_command_error)?;
                 } else {
-                    let old_tree = wc_commit.tree();
-                    let new_tree = new_wc_commit.tree();
-                    export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
-                        .await
-                        .map_err(snapshot_command_error)?;
-                }
+                let old_tree = wc_commit.tree();
+                let new_tree = new_wc_commit.tree();
+                export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
+                    .await
+                    .map_err(snapshot_command_error)?;
+            }
             }
 
             let repo = self
@@ -2828,9 +2827,9 @@ impl WorkspaceCommandTransaction<'_> {
             // replaces it with the `move_to` ID.
             self.repo_mut()
                 .merge_local_bookmark(
-                    &bookmark.name,
-                    &RefTarget::normal(bookmark.old_commit_id),
-                    &RefTarget::normal(move_to.clone()),
+                &bookmark.name,
+                &RefTarget::normal(bookmark.old_commit_id),
+                &RefTarget::normal(move_to.clone()),
                 )
                 .await?;
         }
@@ -3979,22 +3978,22 @@ fn resolve_aliases(
             // No more alias commands, or hit unknown option
             return Ok(string_args);
         };
-        let alias_name = command_name.to_string();
-        let alias_args = submatches
-            .get_many::<OsString>("")
-            .unwrap_or_default()
-            .map(|arg| arg.to_str().unwrap().to_string())
-            .collect_vec();
+            let alias_name = command_name.to_string();
+            let alias_args = submatches
+                .get_many::<OsString>("")
+                .unwrap_or_default()
+                .map(|arg| arg.to_str().unwrap().to_string())
+                .collect_vec();
         let Some(&alias_name) = defined_aliases.get(&*alias_name) else {
             // Not a real command and not an alias, so return what we've resolved so far
             return Ok(string_args);
         };
-        let alias_definition: Vec<String> = match config.get(["aliases", alias_name]) {
-            Ok(definition) => definition,
-            Err(original_err) => config
-                .get(["aliases", alias_name, "definition"])
-                .map_err(|_| original_err)?,
-        };
+                let alias_definition: Vec<String> = match config.get(["aliases", alias_name]) {
+                    Ok(definition) => definition,
+                    Err(original_err) => config
+                        .get(["aliases", alias_name, "definition"])
+                        .map_err(|_| original_err)?,
+                };
         let alias_position = string_args.len() - 1 - alias_args.len();
 
         // recursion check
@@ -4024,10 +4023,10 @@ fn resolve_aliases(
             alias_position..(alias_position + alias_definition.len()),
         ));
 
-        assert!(string_args.ends_with(&alias_args));
+                assert!(string_args.ends_with(&alias_args));
         string_args.truncate(alias_position);
-        string_args.extend(alias_definition);
-        string_args.extend_from_slice(&alias_args);
+                string_args.extend(alias_definition);
+                string_args.extend_from_slice(&alias_args);
     }
 }
 

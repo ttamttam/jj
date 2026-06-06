@@ -16,8 +16,7 @@
 //! default local-disk implementation.
 
 use std::any::Any;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,6 +172,12 @@ pub enum SnapshotError {
     /// A tracked path contained invalid component such as `..`.
     #[error(transparent)]
     InvalidRepoPath(#[from] InvalidRepoPathError),
+    /// A path in the working copy was not valid UTF-8.
+    #[error("Working copy path {} is not valid UTF-8", path.to_string_lossy())]
+    InvalidUtf8Path {
+        /// The path with invalid UTF-8.
+        path: OsString,
+    },
     /// A symlink target in the working copy was not valid UTF-8.
     #[error("Symlink {path} target is not valid UTF-8")]
     InvalidUtf8SymlinkTarget {
@@ -238,6 +243,8 @@ pub struct SnapshotStats {
     /// as (directory, file name) pairs. These paths cannot be represented as
     /// `RepoPath`s.
     pub invalid_utf8_paths: BTreeSet<(RepoPathBuf, OsString)>,
+    /// List of paths that were ignored by .gitignore.
+    pub ignored_paths: BTreeSet<RepoPathBuf>,
 }
 
 /// Reason why the new path isn't tracked.

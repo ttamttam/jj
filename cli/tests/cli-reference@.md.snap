@@ -3340,11 +3340,15 @@ Note: You can use `jj diff --summary -r <rev>` to see the changed files for a sp
 
 [Conflicted bookmarks]: https://docs.jj-vcs.dev/latest/bookmarks/#conflicts
 
-**Usage:** `jj status [FILESETS]...`
+**Usage:** `jj status [OPTIONS] [FILESETS]...`
 
 ###### **Arguments:**
 
 * `<FILESETS>` — Restrict the status display to these paths
+
+###### **Options:**
+
+* `--ignored` — Show ignored files
 
 
 
