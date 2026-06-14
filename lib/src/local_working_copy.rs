@@ -1605,9 +1605,16 @@ impl FileSnapshotter<'_> {
     ) -> Result<Option<(PresentDirEntryKind, String)>, SnapshotError> {
         let file_type = entry.file_type().unwrap();
         let file_name = entry.file_name();
-        let name_string = file_name
-            .into_string()
-            .map_err(|path| SnapshotError::InvalidUtf8Path { path })?;
+        let name_string = match file_name.into_string() {
+            Ok(name_string) => name_string,
+            Err(name) => {
+                // A path that isn't valid UTF-8 can't be represented as a
+                // RepoPath, so it can never be tracked. Skip it instead of
+                // failing the whole snapshot, and let the caller report it.
+                self.invalid_utf8_paths_tx.send((dir.to_owned(), name)).ok();
+                return Ok(None);
+            }
+        };
 
         if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
             return Ok(None);
@@ -1640,14 +1647,25 @@ impl FileSnapshotter<'_> {
             if git_ignore.matches_dir(&path)
                 && self.force_tracking_matcher.visit(&path).is_nothing()
             {
-                // If the whole directory is ignored by .gitignore, visit only
-                // paths we're already tracking. This is because .gitignore in
-                // ignored directory must be ignored. It's also more efficient.
-                // start_tracking_matcher is NOT tested here because we need to
-                // scan directory entries to report untracked paths.
-                self.ignored_paths_tx.send(path.clone()).ok();
-                self.spawn_ok(scope, move |_| {
-                    self.visit_tracked_files(file_states).block_on()
+                // If the whole directory is ignored by .gitignore, visit all
+                // entries but report individual (new) files as ignored instead
+                // of the whole directory. This is because .gitignore in ignored
+                // directory must be ignored. It's also more efficient to walk
+                // the directory ourselves without re-interpreting .gitignore.
+                let ignored_dir = path.clone();
+                let ignored_disk_dir = disk_dir.clone();
+                self.spawn_ok(scope, move |scope| {
+                    async move {
+                        self.visit_tracked_files(file_states).await?;
+                        self.visit_ignored_dir_entries(
+                            &ignored_dir,
+                            &ignored_disk_dir,
+                            file_states,
+                            scope,
+                        )
+                        .await
+                    }
+                    .block_on()
                 });
             } else if !self.matcher.visit(&path).is_nothing() {
                 let directory_to_visit = DirectoryToVisit {
@@ -1752,6 +1770,73 @@ impl FileSnapshotter<'_> {
                 .await?;
             } else {
                 self.deleted_files_tx.send(tracked_path.to_owned()).ok();
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits entries in an ignored directory, reporting new (untracked) files
+    /// individually and subdirectories without tracked files as ignored paths.
+    /// Recurses into subdirectories that contain tracked files to find
+    /// individual ignored files. Does not re-interpret `.gitignore` files
+    /// inside the directory.
+    async fn visit_ignored_dir_entries<'scope>(
+        &'scope self,
+        dir: &RepoPath,
+        disk_dir: &Path,
+        file_states: FileStates<'scope>,
+        scope: &rayon::Scope<'scope>,
+    ) -> Result<(), SnapshotError> {
+        let dir_entries: Vec<_> = disk_dir
+            .read_dir()
+            .and_then(|entries| entries.try_collect())
+            .map_err(|err| SnapshotError::Other {
+                message: format!("Failed to read directory {}", disk_dir.display()),
+                err: err.into(),
+            })?;
+        for entry in &dir_entries {
+            let file_type = entry.file_type().unwrap();
+            let file_name = entry.file_name();
+            let Ok(name_string) = file_name.into_string() else {
+                // The path can't be represented as a RepoPath, so it can never
+                // be tracked. Since the whole directory is ignored, there's no
+                // need to report it either.
+                continue;
+            };
+            if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
+                continue;
+            }
+            let name = RepoPathComponent::new(&name_string).unwrap();
+            let path = dir.join(name);
+            if file_type.is_dir() {
+                let entry_disk_dir = entry.path();
+                if RESERVED_DIR_NAMES
+                    .iter()
+                    .any(|n| entry_disk_dir.join(n).symlink_metadata().is_ok())
+                {
+                    continue;
+                }
+                let child_file_states = file_states.prefixed_at(dir, name);
+                if child_file_states.is_empty() {
+                    // No tracked files underneath → report the directory itself
+                    self.ignored_paths_tx.send(path).ok();
+                } else {
+                    // Has tracked files → recurse to find individual ignored files
+                    let child_disk_dir = entry_disk_dir;
+                    self.spawn_ok(scope, move |scope| {
+                        self.visit_ignored_dir_entries(
+                            &path,
+                            &child_disk_dir,
+                            child_file_states,
+                            scope,
+                        )
+                        .block_on()
+                    });
+                }
+            } else if file_type.is_file()
+                && file_states.get_at(dir, name).is_none()
+            {
+                self.ignored_paths_tx.send(path).ok();
             }
         }
         Ok(())

@@ -714,6 +714,7 @@ impl CommandHelper {
                     } = stale_stats;
                     untracked_paths.extend(fresh_stats.untracked_paths);
                     invalid_utf8_paths.extend(fresh_stats.invalid_utf8_paths);
+                    ignored_paths.extend(fresh_stats.ignored_paths);
                     SnapshotStats {
                         untracked_paths,
                         invalid_utf8_paths,
