@@ -91,6 +91,50 @@ fn test_status_ignored_gitignore() {
 }
 
 #[test]
+fn test_status_ignored_mixed_tracked_and_untracked_paths() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file(".gitignore", "*.ignored\ntracked-dir/\nignored-root/\n");
+    // Tracked files that are also ignored by .gitignore.
+    work_dir.write_file("tracked.ignored", "content");
+    work_dir.write_file("tracked-dir/file1.txt", "content");
+    work_dir.write_file("tracked-dir/file2.txt", "content");
+    // Tracked files inside a fully ignored directory.
+    work_dir.write_file("ignored-root/root-tracked.txt", "content");
+    work_dir.write_file("ignored-root/mixed/nested/tracked-nested.txt", "content");
+    for path in [
+        "tracked.ignored",
+        "tracked-dir",
+        "ignored-root/root-tracked.txt",
+        "ignored-root/mixed/nested/tracked-nested.txt",
+    ] {
+        work_dir
+            .run_jj(["file", "track", "--include-ignored", path])
+            .success();
+    }
+    // Commit the tracked files, and leave the working copy clean.
+    work_dir.run_jj(["commit", "-m", "setup"]).success();
+
+    // Untracked files inside ignored directories.
+    work_dir.write_file("ignored-root/root-untracked.txt", "content");
+    work_dir.write_file("ignored-root/mixed/nested/untracked-nested.txt", "content");
+    work_dir.write_file("ignored-root/only-ignored/file.txt", "content");
+
+    let output = work_dir.run_jj(["status", "--ignored"]);
+    insta::assert_snapshot!(output, @"
+    Ignored paths:
+    I ignored-root/mixed/nested/untracked-nested.txt
+    I ignored-root/only-ignored/
+    I ignored-root/root-untracked.txt
+    Working copy  (@) : royxmykx 9a1847be (empty) (no description set)
+    Parent commit (@-): qpvuntsm 42050939 setup
+    [EOF]
+    ");
+}
+
+#[test]
 fn test_status_filtered() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
