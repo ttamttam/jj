@@ -47,6 +47,8 @@ This document contains the help content for the `jj` command-line program.
 * [`jj file annotate`↴](#jj-file-annotate)
 * [`jj file chmod`↴](#jj-file-chmod)
 * [`jj file list`↴](#jj-file-list)
+* [`jj file list-ignored`↴](#jj-file-list-ignored)
+* [`jj file remove-ignored`↴](#jj-file-remove-ignored)
 * [`jj file search`↴](#jj-file-search)
 * [`jj file show`↴](#jj-file-show)
 * [`jj file track`↴](#jj-file-track)
@@ -1146,6 +1148,8 @@ File operations
 * `annotate` — Show the source change for each line of the target file
 * `chmod` — Sets or removes the executable bit for paths in the repo
 * `list` — List files in a revision
+* `list-ignored` — List files ignored by .gitignore in the working copy
+* `remove-ignored` — Remove files ignored by .gitignore in the working copy
 * `search` — Search for content in files
 * `show` — Print contents of files in a revision
 * `track` — Start tracking specified paths in the working copy
@@ -1232,6 +1236,22 @@ List files in a revision
    [`TreeEntry` type]: https://docs.jj-vcs.dev/latest/templates/#treeentry-type
 
    [`jj help -k templates`]: https://docs.jj-vcs.dev/latest/templates/
+
+
+
+## `jj file list-ignored`
+
+List files ignored by .gitignore in the working copy
+
+**Usage:** `jj file list-ignored`
+
+
+
+## `jj file remove-ignored`
+
+Remove files ignored by .gitignore in the working copy
+
+**Usage:** `jj file remove-ignored`
 
 
 
