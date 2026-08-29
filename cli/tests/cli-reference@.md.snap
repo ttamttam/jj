@@ -1324,6 +1324,8 @@ If the file is conflicted, the conflict markers are materialized in the editor. 
 
 List files in a revision
 
+With `--ignored`, list paths ignored by .gitignore in the working copy instead. The listed paths are exactly the ones that `--delete` would remove.
+
 **Usage:** `jj file list [OPTIONS] [FILESETS]...`
 
 ###### **Arguments:**
@@ -1344,6 +1346,12 @@ List files in a revision
    [TreeEntry]: https://docs.jj-vcs.dev/latest/templates/#treeentry-type
 
    [templates]: https://docs.jj-vcs.dev/latest/templates/
+* `--ignored` — List paths ignored by .gitignore in the working copy instead of files in a revision
+
+   A directory whose content is entirely ignored is listed as a single entry, with a trailing `/`.
+* `--delete` — Delete the listed ignored paths instead of listing them
+
+   Ignored directories are removed recursively. Only the listed paths are removed, so `file list --ignored` can be used as a dry run.
 
 
 

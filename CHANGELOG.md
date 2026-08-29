@@ -16,6 +16,11 @@ and this project adheres to
 
 ### New features
 
+* `jj file list --ignored` lists paths ignored by `.gitignore` in the working
+  copy. Paths are listed and deleted exactly as shown, so the command can be
+  used as a dry run before `jj file list --ignored --delete`. Fully ignored
+  directories are listed as a single entry and deleted recursively.
+
 ### Fixed bugs
 
 ## [0.47.1] - 2026-11-04

@@ -1103,6 +1103,21 @@ pub fn all_revision_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate>
     all_files_from_rev(parse::revision_or_wc(), current)
 }
 
+/// Completes paths for `jj file list`.
+///
+/// With `--ignored`, the paths aren't revision files (they're ignored, so
+/// they're absent from the tree), and computing them would require
+/// snapshotting the working copy. Fall back to the shell's normal path
+/// completion instead.
+pub fn file_list_paths(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    if std::env::args().any(|arg| arg == "--ignored") {
+        use clap_complete::engine::ValueCompleter as _;
+        clap_complete::PathCompleter::any().complete(current)
+    } else {
+        all_revision_files(current)
+    }
+}
+
 pub fn modified_revision_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     modified_files_from_rev(parse::revision_or_wc(), current)
 }

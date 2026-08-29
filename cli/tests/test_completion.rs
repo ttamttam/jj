@@ -2339,3 +2339,24 @@ fn test_command_alias_with_exec() {
     [EOF]
     ");
 }
+
+#[test]
+fn test_file_list_ignored_paths_completion() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file(".gitignore", "*.log\n");
+    work_dir.write_file("tracked.txt", "content");
+    work_dir.write_file("ignored.log", "content");
+    work_dir.write_file("ignored-dir/file.log", "content");
+
+    // Ignored paths aren't tracked, so completion falls back to the normal
+    // shell path completion instead of listing files in a revision.
+    let output = work_dir.complete_fish(["file", "list", "--ignored", "ign"]);
+    insta::assert_snapshot!(output, @"
+    ignored-dir/
+    ignored.log
+    [EOF]
+    ");
+}
