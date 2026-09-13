@@ -1,0 +1,1129 @@
+diff --git a/cli/src/cli_util.rs b/cli/src/cli_util.rs
+index cad6842c79..9ca0f08dd5 100644
+--- a/cli/src/cli_util.rs
++++ b/cli/src/cli_util.rs
+@@ -133,6 +133,7 @@
+ use jj_lib::str_util::StringMatcher;
+ use jj_lib::transaction::Transaction;
+ use jj_lib::transaction::TransactionCommitError;
++use jj_lib::tree::TreeMergeExt as _;
+ use jj_lib::ui_path::RepoPathUiConverter;
+ use jj_lib::ui_path::UiPathParseError;
+ use jj_lib::working_copy;
+@@ -741,12 +742,15 @@
+                     let SnapshotStats {
+                         mut untracked_paths,
+                         mut invalid_utf8_paths,
++                        mut ignored_paths,
+                     } = stale_stats;
+                     untracked_paths.extend(fresh_stats.untracked_paths);
+                     invalid_utf8_paths.extend(fresh_stats.invalid_utf8_paths);
++                    ignored_paths.extend(fresh_stats.ignored_paths);
+                     SnapshotStats {
+                         untracked_paths,
+                         invalid_utf8_paths,
++                        ignored_paths,
+                     }
+                 };
+                 Ok((workspace_command, merged_stats))
+@@ -3304,6 +3308,66 @@
+     Ok(())
+ }
+ 
++/// Visits paths (e.g. untracked or ignored paths) and calls `on_path` for each
++/// path that should be printed, collapsing consecutive paths under a directory
++/// that is not part of the (tracked) tree into a single directory entry.
++pub(crate) async fn visit_collapsed_untracked_files(
++    untracked_paths: impl IntoIterator<Item = impl AsRef<RepoPath>>,
++    tree: MergedTree,
++    mut on_path: impl FnMut(&RepoPath, bool) -> Result<(), CommandError>,
++) -> Result<(), CommandError> {
++    let trees = tree.trees().await?;
++    let mut stack = vec![trees];
++
++    let mut skip_prefixed_by_dir: Option<RepoPathBuf> = None;
++    'untracked: for path in untracked_paths {
++        let path = path.as_ref();
++        if skip_prefixed_by_dir
++            .as_ref()
++            .is_some_and(|p| path.starts_with(p))
++        {
++            continue;
++        } else {
++            skip_prefixed_by_dir = None;
++        }
++
++        let mut it = path.components().dropping_back(1);
++        let first_mismatch = it.by_ref().enumerate().find(|(i, component)| {
++            stack.get(i + 1).is_none_or(|tree| {
++                tree.dir()
++                    .components()
++                    .next_back()
++                    .expect("should always have at least one element (the root)")
++                    != *component
++            })
++        });
++
++        if let Some((i, component)) = first_mismatch {
++            stack.truncate(i + 1);
++            for component in std::iter::once(component).chain(it) {
++                let parent = stack
++                    .last()
++                    .expect("should always have at least one element (the root)");
++
++                if let Some(subtree) = parent.sub_tree(component).await? {
++                    stack.push(subtree);
++                } else {
++                    let dir = parent.dir().join(component);
++
++                    on_path(&dir, true)?;
++                    skip_prefixed_by_dir = Some(dir);
++
++                    continue 'untracked;
++                }
++            }
++        }
++
++        on_path(path, false)?;
++    }
++
++    Ok(())
++}
++
+ /// Prints a hint about how to handle large files that were refused during
+ /// snapshot.
+ ///
+@@ -4860,3 +4924,76 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod visit_collapsed_tests {
++    use testutils::TestRepo;
++    use testutils::TestTreeBuilder;
++    use testutils::repo_path;
++
++    use super::*;
++
++    fn collect_collapsed_untracked_files_string(
++        untracked_paths: &[&RepoPath],
++        tree: MergedTree,
++    ) -> String {
++        let mut result = String::new();
++        visit_collapsed_untracked_files(untracked_paths, tree, |path, is_dir| {
++            result.push_str("? ");
++            if is_dir {
++                result.push_str(&path.to_internal_dir_string());
++            } else {
++                result.push_str(path.as_internal_file_string());
++            }
++            result.push('\n');
++            Ok(())
++        })
++        .block_on()
++        .unwrap();
++        result
++    }
++
++    #[test]
++    fn test_collapsed_untracked_files() {
++        let repo = TestRepo::init();
++
++        let tracked = {
++            let mut builder = TestTreeBuilder::new(repo.repo.store().clone());
++
++            builder.file(repo_path("top_level_file"), "");
++            // ? "untracked_top_level_file"
++            // ? "dir"
++            // ? "dir2/c"
++            builder.file(repo_path("dir2/d"), "");
++            // ? "dir3/partially_tracked/e"
++            builder.file(repo_path("dir3/partially_tracked/f"), "");
++            // ? "dir3/fully_untracked/"
++            builder.file(repo_path("dir3/j"), "");
++            // ? "dir3/k"
++
++            builder.write_merged_tree()
++        };
++        let untracked = &[
++            repo_path("untracked_top_level_file"),
++            repo_path("dir/a"),
++            repo_path("dir/b"),
++            repo_path("dir2/c"),
++            repo_path("dir3/partially_tracked/e"),
++            repo_path("dir3/fully_untracked/g"),
++            repo_path("dir3/fully_untracked/h"),
++            repo_path("dir3/k"),
++        ];
++
++        insta::assert_snapshot!(
++            collect_collapsed_untracked_files_string(untracked, tracked),
++            @"
++        ? untracked_top_level_file
++        ? dir/
++        ? dir2/c
++        ? dir3/partially_tracked/e
++        ? dir3/fully_untracked/
++        ? dir3/k
++        "
++        );
++    }
++}
+diff --git a/cli/src/commands/file/list_ignored.rs b/cli/src/commands/file/list_ignored.rs
+new file mode 100644
+index 0000000000..8cf528dbf2
+--- /dev/null
++++ b/cli/src/commands/file/list_ignored.rs
+@@ -0,0 +1,65 @@
++// Copyright 2020 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use std::io::Write as _;
++
++use tracing::instrument;
++
++use crate::cli_util::CommandHelper;
++use crate::command_error::CommandError;
++use crate::ui::Ui;
++
++/// List files ignored by .gitignore in the working copy
++#[derive(clap::Args, Clone, Debug)]
++pub(crate) struct FileListIgnoredArgs {
++    /// Only list ignored paths matching these filesets
++    #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
++    paths: Vec<String>,
++}
++
++#[instrument(skip_all)]
++pub(crate) async fn cmd_file_list_ignored(
++    ui: &mut Ui,
++    command: &CommandHelper,
++    args: &FileListIgnoredArgs,
++) -> Result<(), CommandError> {
++    let (workspace_command, snapshot_stats, _) = command.workspace_helper_with_stats(ui).await?;
++    if snapshot_stats.ignored_paths.is_empty() {
++        return Ok(());
++    }
++    let matcher = workspace_command
++        .parse_file_patterns(ui, &args.paths)?
++        .to_matcher();
++    ui.request_pager();
++    let mut formatter = ui.stdout_formatter();
++    for ignored in &snapshot_stats.ignored_paths {
++        let path_matches = if ignored.is_dir {
++            !matcher.visit(&ignored.path).is_nothing()
++        } else {
++            matcher.matches(&ignored.path)
++        };
++        if !path_matches {
++            continue;
++        }
++        let mut ui_path = workspace_command.format_file_path(&ignored.path);
++        if ignored.is_dir {
++            // Always use '/' regardless of platform, matching jj's other
++            // path output (e.g. `jj status`), rather than
++            // `std::path::MAIN_SEPARATOR` which would be '\' on Windows.
++            ui_path.push('/');
++        }
++        writeln!(formatter, "{ui_path}")?;
++    }
++    Ok(())
++}
+diff --git a/cli/src/commands/file/mod.rs b/cli/src/commands/file/mod.rs
+index 96c1cd7d67..774f2ed98b 100644
+--- a/cli/src/commands/file/mod.rs
++++ b/cli/src/commands/file/mod.rs
+@@ -15,6 +15,8 @@
+ mod annotate;
+ mod chmod;
+ mod list;
++mod list_ignored;
++mod remove_ignored;
+ mod search;
+ mod show;
+ mod track;
+@@ -30,6 +32,8 @@
+     Annotate(annotate::FileAnnotateArgs),
+     Chmod(chmod::FileChmodArgs),
+     List(list::FileListArgs),
++    ListIgnored(list_ignored::FileListIgnoredArgs),
++    RemoveIgnored(remove_ignored::FileRemoveIgnoredArgs),
+     Search(search::FileSearchArgs),
+     Show(show::FileShowArgs),
+     Track(track::FileTrackArgs),
+@@ -45,6 +49,11 @@
+         FileCommand::Annotate(args) => annotate::cmd_file_annotate(ui, command, args).await,
+         FileCommand::Chmod(args) => chmod::cmd_file_chmod(ui, command, args).await,
+         FileCommand::List(args) => list::cmd_file_list(ui, command, args).await,
++        FileCommand::ListIgnored(args) => list_ignored::cmd_file_list_ignored(ui, command, args)
++            .await,
++        FileCommand::RemoveIgnored(args) => {
++            remove_ignored::cmd_file_remove_ignored(ui, command, args).await
++        }
+         FileCommand::Search(args) => search::cmd_file_search(ui, command, args).await,
+         FileCommand::Show(args) => show::cmd_file_show(ui, command, args).await,
+         FileCommand::Track(args) => track::cmd_file_track(ui, command, args).await,
+diff --git a/cli/src/commands/file/remove_ignored.rs b/cli/src/commands/file/remove_ignored.rs
+new file mode 100644
+index 0000000000..41db87c83c
+--- /dev/null
++++ b/cli/src/commands/file/remove_ignored.rs
+@@ -0,0 +1,129 @@
++// Copyright 2020 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use std::collections::BTreeSet;
++use std::io::Write as _;
++
++use jj_lib::repo_path::RepoPathBuf;
++use tracing::instrument;
++
++use crate::cli_util::CommandHelper;
++use crate::command_error::CommandError;
++use crate::command_error::user_error;
++use crate::ui::Ui;
++
++/// Remove files ignored by .gitignore in the working copy
++///
++/// Without arguments, all ignored paths are removed. Pass one or more paths
++/// to restrict the removal to a known-safe subset (e.g. a single
++/// directory), leaving other ignored content (such as a build directory
++/// you're still using) untouched. Use `jj file list-ignored` with the same
++/// paths beforehand to preview what would be removed.
++#[derive(clap::Args, Clone, Debug)]
++pub(crate) struct FileRemoveIgnoredArgs {
++    /// Only remove ignored paths matching these filesets
++    #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
++    paths: Vec<String>,
++}
++
++#[instrument(skip_all)]
++pub(crate) async fn cmd_file_remove_ignored(
++    ui: &mut Ui,
++    command: &CommandHelper,
++    args: &FileRemoveIgnoredArgs,
++) -> Result<(), CommandError> {
++    let (workspace_command, snapshot_stats, _) = command.workspace_helper_with_stats(ui).await?;
++    let matcher = workspace_command
++        .parse_file_patterns(ui, &args.paths)?
++        .to_matcher();
++    let workspace_root = workspace_command.workspace_root();
++    let mut removed_count = 0;
++    let mut removed_parents: BTreeSet<RepoPathBuf> = BTreeSet::new();
++    // `snapshot_stats.ignored_paths` is the exact same list shown by
++    // `file list-ignored`: we remove exactly what that command lists (after
++    // filtering by `args.paths`, if given), no more and no less. A directory
++    // is only ever reported as a single entry there when it's fully covered
++    // by a `.gitignore` directory pattern (in which case everything
++    // underneath it is guaranteed ignored); an ordinary directory that
++    // merely ends up containing only individually-ignored files (e.g. via a
++    // `*.log` pattern) is reported file by file, since it could also contain
++    // an unrelated, not-yet-ignored file that must not be touched.
++    for ignored in &snapshot_stats.ignored_paths {
++        let path_matches = if ignored.is_dir {
++            // We're about to remove the whole directory as a unit, so it's
++            // enough for the fileset to be relevant anywhere under it.
++            !matcher.visit(&ignored.path).is_nothing()
++        } else {
++            matcher.matches(&ignored.path)
++        };
++        if !path_matches {
++            continue;
++        }
++        let disk_path = ignored
++            .path
++            .to_fs_path(workspace_root)
++            .map_err(|err| user_error(format!("Invalid path: {err}")))?;
++        let Ok(metadata) = disk_path.symlink_metadata() else {
++            // The file or directory was already removed (possibly
++            // concurrently). Treat it as already deleted.
++            continue;
++        };
++        if ignored.is_dir || metadata.is_dir() {
++            std::fs::remove_dir_all(&disk_path).map_err(|err| {
++                user_error(format!(
++                    "Failed to remove directory {}: {err}",
++                    disk_path.display()
++                ))
++            })?;
++        } else {
++            std::fs::remove_file(&disk_path).map_err(|err| {
++                user_error(format!(
++                    "Failed to remove file {}: {err}",
++                    disk_path.display()
++                ))
++            })?;
++        }
++        removed_count += 1;
++        if let Some(parent) = ignored.path.parent() {
++            removed_parents.insert(parent.to_owned());
++        }
++    }
++    // Clean up directories that became empty as a side effect of the
++    // removals above (e.g. a directory that only ever contained
++    // individually-ignored files). This never removes anything beyond what
++    // was already deleted above: each directory is only removed once it's
++    // verified, on disk, to be empty; we stop climbing as soon as we hit a
++    // directory that still has content (tracked, untracked, or otherwise),
++    // or the workspace root.
++    for parent in removed_parents {
++        let mut dir = Some(parent);
++        while let Some(current) = dir {
++            if current.is_root() {
++                break;
++            }
++            let disk_dir = current
++                .to_fs_path(workspace_root)
++                .map_err(|err| user_error(format!("Invalid path: {err}")))?;
++            match std::fs::remove_dir(&disk_dir) {
++                Ok(()) => dir = current.parent().map(ToOwned::to_owned),
++                Err(_) => break,
++            }
++        }
++    }
++    writeln!(
++        ui.status(),
++        "Removed {removed_count} ignored file(s) from the working copy."
++    )?;
++    Ok(())
++}
+diff --git a/cli/src/commands/status.rs b/cli/src/commands/status.rs
+index 93116b1c25..892c96ebed 100644
+--- a/cli/src/commands/status.rs
++++ b/cli/src/commands/status.rs
+@@ -26,7 +26,6 @@
+ use jj_lib::repo_path::RepoPathBuf;
+ use jj_lib::revset::RevsetExpression;
+ use jj_lib::revset::RevsetFilterPredicate;
+-use jj_lib::tree::TreeMergeExt as _;
+ use jj_lib::working_copy::SnapshotStats;
+ use jj_lib::working_copy::UntrackedReason;
+ use tracing::instrument;
+@@ -35,6 +34,7 @@
+ use crate::cli_util::print_conflicted_paths;
+ use crate::cli_util::print_snapshot_stats;
+ use crate::cli_util::print_unmatched_explicit_paths;
++use crate::cli_util::visit_collapsed_untracked_files;
+ use crate::command_error::CommandError;
+ use crate::diff_util::DiffFormat;
+ use crate::diff_util::get_copy_records;
+@@ -290,137 +290,3 @@
+         untracked_paths,
+     })
+ }
+-
+-async fn visit_collapsed_untracked_files(
+-    untracked_paths: impl IntoIterator<Item = impl AsRef<RepoPath>>,
+-    tree: MergedTree,
+-    mut on_path: impl FnMut(&RepoPath, bool) -> Result<(), CommandError>,
+-) -> Result<(), CommandError> {
+-    let trees = tree.trees().await?;
+-    let mut stack = vec![trees];
+-
+-    // TODO: This loop can be improved with BTreeMap cursors once that's stable,
+-    // would remove the need for the whole `skip_prefixed_by` thing and turn it
+-    // into a B-tree lookup.
+-    let mut skip_prefixed_by_dir: Option<RepoPathBuf> = None;
+-    'untracked: for path in untracked_paths {
+-        let path = path.as_ref();
+-        if skip_prefixed_by_dir
+-            .as_ref()
+-            .is_some_and(|p| path.starts_with(p))
+-        {
+-            continue;
+-        } else {
+-            skip_prefixed_by_dir = None;
+-        }
+-
+-        let mut it = path.components().dropping_back(1);
+-        let first_mismatch = it.by_ref().enumerate().find(|(i, component)| {
+-            stack.get(i + 1).is_none_or(|tree| {
+-                tree.dir()
+-                    .components()
+-                    .next_back()
+-                    .expect("should always have at least one element (the root)")
+-                    != *component
+-            })
+-        });
+-
+-        if let Some((i, component)) = first_mismatch {
+-            stack.truncate(i + 1);
+-            for component in std::iter::once(component).chain(it) {
+-                let parent = stack
+-                    .last()
+-                    .expect("should always have at least one element (the root)");
+-
+-                if let Some(subtree) = parent.sub_tree(component).await? {
+-                    stack.push(subtree);
+-                } else {
+-                    let dir = parent.dir().join(component);
+-
+-                    on_path(&dir, true)?;
+-                    skip_prefixed_by_dir = Some(dir);
+-
+-                    continue 'untracked;
+-                }
+-            }
+-        }
+-
+-        on_path(path, false)?;
+-    }
+-
+-    Ok(())
+-}
+-
+-#[cfg(test)]
+-mod test {
+-    use pollster::FutureExt as _;
+-    use testutils::TestRepo;
+-    use testutils::TestTreeBuilder;
+-    use testutils::repo_path;
+-
+-    use super::*;
+-
+-    fn collect_collapsed_untracked_files_string(
+-        untracked_paths: &[&RepoPath],
+-        tree: MergedTree,
+-    ) -> String {
+-        let mut result = String::new();
+-        visit_collapsed_untracked_files(untracked_paths, tree, |path, is_dir| {
+-            result.push_str("? ");
+-            if is_dir {
+-                result.push_str(&path.to_internal_dir_string());
+-            } else {
+-                result.push_str(path.as_internal_file_string());
+-            }
+-            result.push('\n');
+-            Ok(())
+-        })
+-        .block_on()
+-        .unwrap();
+-        result
+-    }
+-
+-    #[test]
+-    fn test_collapsed_untracked_files() {
+-        let repo = TestRepo::init();
+-
+-        let tracked = {
+-            let mut builder = TestTreeBuilder::new(repo.repo.store().clone());
+-
+-            builder.file(repo_path("top_level_file"), "");
+-            // ? "untracked_top_level_file"
+-            // ? "dir"
+-            // ? "dir2/c"
+-            builder.file(repo_path("dir2/d"), "");
+-            // ? "dir3/partially_tracked/e"
+-            builder.file(repo_path("dir3/partially_tracked/f"), "");
+-            // ? "dir3/fully_untracked/"
+-            builder.file(repo_path("dir3/j"), "");
+-            // ? "dir3/k"
+-
+-            builder.write_merged_tree()
+-        };
+-        let untracked = &[
+-            repo_path("untracked_top_level_file"),
+-            repo_path("dir/a"),
+-            repo_path("dir/b"),
+-            repo_path("dir2/c"),
+-            repo_path("dir3/partially_tracked/e"),
+-            repo_path("dir3/fully_untracked/g"),
+-            repo_path("dir3/fully_untracked/h"),
+-            repo_path("dir3/k"),
+-        ];
+-
+-        insta::assert_snapshot!(
+-            collect_collapsed_untracked_files_string(untracked, tracked),
+-            @"
+-        ? untracked_top_level_file
+-        ? dir/
+-        ? dir2/c
+-        ? dir3/partially_tracked/e
+-        ? dir3/fully_untracked/
+-        ? dir3/k
+-        "
+-        );
+-    }
+-}
+diff --git a/cli/tests/cli-reference@.md.snap b/cli/tests/cli-reference@.md.snap
+index 88e8c71302..90337dca53 100644
+--- a/cli/tests/cli-reference@.md.snap
++++ b/cli/tests/cli-reference@.md.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: cli/tests/test_generate_md_cli_help.rs
++assertion_line: 45
+ description: "AUTO-GENERATED FILE, DO NOT EDIT. This cli reference is generated by a test as an `insta` snapshot. MkDocs includes this snapshot from docs/cli-reference.md."
+ ---
+ 
+@@ -48,6 +49,8 @@
+ * [`jj file annotate`↴](#jj-file-annotate)
+ * [`jj file chmod`↴](#jj-file-chmod)
+ * [`jj file list`↴](#jj-file-list)
++* [`jj file list-ignored`↴](#jj-file-list-ignored)
++* [`jj file remove-ignored`↴](#jj-file-remove-ignored)
+ * [`jj file search`↴](#jj-file-search)
+ * [`jj file show`↴](#jj-file-show)
+ * [`jj file track`↴](#jj-file-track)
+@@ -1200,6 +1203,8 @@
+ * `annotate` — Show the source change for each line of the target file
+ * `chmod` — Sets or removes the executable bit for paths in the repo
+ * `list` — List files in a revision
++* `list-ignored` — List files ignored by .gitignore in the working copy
++* `remove-ignored` — Remove files ignored by .gitignore in the working copy
+ * `search` — Search for content in files
+ * `show` — Print contents of files in a revision
+ * `track` — Start tracking specified paths in the working copy
+@@ -1289,6 +1294,32 @@
+ 
+ 
+ 
++## `jj file list-ignored`
++
++List files ignored by .gitignore in the working copy
++
++**Usage:** `jj file list-ignored [FILESETS]...`
++
++###### **Arguments:**
++
++* `<FILESETS>` — Only list ignored paths matching these filesets
++
++
++
++## `jj file remove-ignored`
++
++Remove files ignored by .gitignore in the working copy
++
++Without arguments, all ignored paths are removed. Pass one or more paths to restrict the removal to a known-safe subset (e.g. a single directory), leaving other ignored content (such as a build directory you're still using) untouched. Use `jj file list-ignored` with the same paths beforehand to preview what would be removed.
++
++**Usage:** `jj file remove-ignored [FILESETS]...`
++
++###### **Arguments:**
++
++* `<FILESETS>` — Only remove ignored paths matching these filesets
++
++
++
+ ## `jj file search`
+ 
+ Search for content in files
+diff --git a/cli/tests/runner.rs b/cli/tests/runner.rs
+index b790cc57d4..14c13ff60e 100644
+--- a/cli/tests/runner.rs
++++ b/cli/tests/runner.rs
+@@ -35,6 +35,7 @@
+ mod test_evolog_command;
+ mod test_file_annotate_command;
+ mod test_file_chmod_command;
++mod test_file_ignored_commands;
+ mod test_file_list_command;
+ mod test_file_search_command;
+ mod test_file_show_command;
+diff --git a/cli/tests/test_file_ignored_commands.rs b/cli/tests/test_file_ignored_commands.rs
+new file mode 100644
+index 0000000000..d002753892
+--- /dev/null
++++ b/cli/tests/test_file_ignored_commands.rs
+@@ -0,0 +1,240 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use insta::assert_snapshot;
++
++use crate::common::TestEnvironment;
++
++#[test]
++fn test_file_list_ignored() {
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "*.ignored\nignored-root/\n");
++    // Untracked files ignored by .gitignore patterns.
++    work_dir.write_file("ignored-root/only-ignored/file.txt", "content");
++    work_dir.write_file("root-ignored.ignored", "content");
++
++    // Fully ignored directories are listed as a single collapsed entry (with
++    // trailing separator), and files matching an ignore pattern are listed
++    // individually.
++    let output = work_dir.run_jj(["file", "list-ignored"]);
++    assert_snapshot!(output, @"
++    ignored-root/
++    root-ignored.ignored
++    [EOF]
++    ");
++}
++
++#[test]
++fn test_file_list_ignored_empty_directory() {
++    // Regression test: an empty directory that matches a directory-level
++    // `.gitignore` pattern should still be listed, even though it has no
++    // content to recurse into.
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "empty-ignored/\n");
++    work_dir.create_dir("empty-ignored");
++
++    let output = work_dir.run_jj(["file", "list-ignored"]);
++    assert_snapshot!(output, @"
++    empty-ignored/
++    [EOF]
++    ");
++}
++
++#[test]
++fn test_file_list_ignored_tracked_files_not_listed() {
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "*.ignored\n");
++    work_dir.write_file("tracked.ignored", "content");
++    work_dir
++        .run_jj(["file", "track", "--include-ignored", "tracked.ignored"])
++        .success();
++    work_dir.run_jj(["commit", "-m", "setup"]).success();
++
++    // A tracked file that matches the ignore patterns is not listed.
++    work_dir.write_file("untracked.ignored", "content");
++    let output = work_dir.run_jj(["file", "list-ignored"]);
++    assert_snapshot!(output, @"
++    untracked.ignored
++    [EOF]
++    ");
++}
++
++#[test]
++fn test_file_remove_ignored() {
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "*.ignored\nignored-root/\n");
++    work_dir.write_file("tracked-file.txt", "content");
++    work_dir.write_file("ignored-root/only-ignored/file.txt", "content");
++    work_dir
++        .run_jj(["file", "track", "tracked-file.txt"])
++        .success();
++    work_dir.run_jj(["commit", "-m", "setup"]).success();
++
++    // Add more ignored files after the commit.
++    work_dir.write_file("root-ignored.ignored", "content");
++    work_dir.write_file("ignored-root/late.ignored", "content");
++
++    // Removal deletes ignored files and directories from the working copy, but
++    // leaves tracked files and .gitignore intact. `ignored-root` has no
++    // tracked files underneath, so it's removed as a single collapsed unit
++    // (matching what `file list-ignored` shows), rather than only deleting
++    // its individual contents and leaving an empty directory behind.
++    let output = work_dir.run_jj(["file", "remove-ignored"]);
++    assert_snapshot!(output, @"
++    ------- stderr -------
++    Removed 2 ignored file(s) from the working copy.
++    [EOF]
++    ");
++    assert!(!work_dir.root().join("root-ignored.ignored").exists());
++    assert!(!work_dir.root().join("ignored-root").exists());
++    assert!(!work_dir.root().join("ignored-root/only-ignored").exists());
++    assert!(!work_dir.root().join("ignored-root/late.ignored").exists());
++    assert!(work_dir.root().join("tracked-file.txt").exists());
++    assert!(work_dir.root().join(".gitignore").exists());
++
++    // A second run reports nothing to remove.
++    let output2 = work_dir.run_jj(["file", "remove-ignored"]);
++    assert_snapshot!(output2, @"
++    ------- stderr -------
++    Removed 0 ignored file(s) from the working copy.
++    [EOF]
++    ");
++}
++
++#[test]
++fn test_file_remove_ignored_removes_now_empty_directory() {
++    // Regression test: a directory that has no dedicated `.gitignore` pattern
++    // of its own, but ends up containing only individually-ignored files
++    // (e.g. via a `*.log` pattern), should be removed entirely by
++    // `remove-ignored` instead of being left behind as an empty directory.
++    // The two files are removed individually (not collapsed into a single
++    // `logs` entry, since `logs/` isn't itself covered by a `.gitignore`
++    // pattern and could in principle contain an unrelated, not-yet-ignored
++    // file that must not be touched); the now-empty `logs` directory is then
++    // cleaned up as a safe side effect, without being counted separately.
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "*.log\n");
++    work_dir.write_file("tracked-file.txt", "content");
++    work_dir
++        .run_jj(["file", "track", "tracked-file.txt"])
++        .success();
++    work_dir.run_jj(["commit", "-m", "setup"]).success();
++
++    // `logs/` itself doesn't match any ignore pattern, only the files inside
++    // it do.
++    work_dir.write_file("logs/one.log", "content");
++    work_dir.write_file("logs/two.log", "content");
++
++    let output = work_dir.run_jj(["file", "remove-ignored"]);
++    assert_snapshot!(output, @"
++    ------- stderr -------
++    Removed 2 ignored file(s) from the working copy.
++    [EOF]
++    ");
++    assert!(!work_dir.root().join("logs").exists());
++    assert!(work_dir.root().join("tracked-file.txt").exists());
++}
++
++#[test]
++fn test_file_remove_ignored_removes_empty_directory() {
++    // Regression test: an empty directory that matches a directory-level
++    // `.gitignore` pattern should be removed by `remove-ignored`, exactly
++    // like it is listed by `list-ignored`.
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "empty-ignored/\n");
++    work_dir.create_dir("empty-ignored");
++
++    let output = work_dir.run_jj(["file", "remove-ignored"]);
++    assert_snapshot!(output, @"
++    ------- stderr -------
++    Removed 1 ignored file(s) from the working copy.
++    [EOF]
++    ");
++    assert!(!work_dir.root().join("empty-ignored").exists());
++}
++
++#[test]
++fn test_file_remove_ignored_does_not_touch_unrelated_file_in_same_directory() {
++    // Safety test: a directory that isn't itself covered by a `.gitignore`
++    // pattern, and that contains both an ignored file and an unrelated file
++    // that isn't ignored, must only have the ignored file removed. The
++    // directory itself must be left behind, since it still has content.
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "*.log\n");
++    work_dir.write_file("logs/one.log", "content");
++    work_dir.write_file("logs/keep.txt", "content");
++
++    let output = work_dir.run_jj(["file", "remove-ignored"]);
++    assert_snapshot!(output, @"
++    ------- stderr -------
++    Removed 1 ignored file(s) from the working copy.
++    [EOF]
++    ");
++    assert!(!work_dir.root().join("logs/one.log").exists());
++    assert!(work_dir.root().join("logs/keep.txt").exists());
++    assert!(work_dir.root().join("logs").exists());
++}
++
++#[test]
++fn test_file_remove_ignored_scoped_to_path() {
++    // Passing a path restricts both `list-ignored` and `remove-ignored` to
++    // that subset, leaving other ignored content (e.g. a build directory
++    // you don't want touched yet) completely untouched. Running
++    // `list-ignored` with the same path first lets you preview what
++    // `remove-ignored` would do, without a separate `--dry-run` flag.
++    let test_env = TestEnvironment::default();
++    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
++    let work_dir = test_env.work_dir("repo");
++
++    work_dir.write_file(".gitignore", "/target/\n/rendered-docs\n");
++    work_dir.write_file("target/some-build-artifact.bin", "content");
++    work_dir.create_dir("rendered-docs");
++
++    let list_output = work_dir.run_jj(["file", "list-ignored", "rendered-docs"]);
++    assert_snapshot!(list_output, @"
++    rendered-docs/
++    [EOF]
++    ");
++
++    let output = work_dir.run_jj(["file", "remove-ignored", "rendered-docs"]);
++    assert_snapshot!(output, @"
++    ------- stderr -------
++    Removed 1 ignored file(s) from the working copy.
++    [EOF]
++    ");
++    assert!(!work_dir.root().join("rendered-docs").exists());
++    // `target/` was never mentioned, so it's left completely alone.
++    assert!(work_dir.root().join("target/some-build-artifact.bin").exists());
++}
+diff --git a/jujutsu-iggnored.patch b/jujutsu-iggnored.patch
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/lib/src/local_working_copy.rs b/lib/src/local_working_copy.rs
+index 87da9f5780..118603775d 100644
+--- a/lib/src/local_working_copy.rs
++++ b/lib/src/local_working_copy.rs
+@@ -16,6 +16,7 @@
+ 
+ use std::borrow::Cow;
+ use std::cmp::Ordering;
++use std::collections::BTreeSet;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::error::Error;
+@@ -119,6 +120,7 @@
+ use crate::store::Store;
+ use crate::working_copy::CheckoutError;
+ use crate::working_copy::CheckoutStats;
++use crate::working_copy::IgnoredPath;
+ use crate::working_copy::LockedWorkingCopy;
+ use crate::working_copy::ResetError;
+ use crate::working_copy::SnapshotError;
+@@ -1331,6 +1333,7 @@
+         let (file_states_tx, file_states_rx) = channel();
+         let (untracked_paths_tx, untracked_paths_rx) = channel();
+         let (invalid_utf8_paths_tx, invalid_utf8_paths_rx) = channel();
++        let (ignored_paths_tx, ignored_paths_rx) = channel();
+         let (deleted_files_tx, deleted_files_rx) = channel();
+ 
+         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
+@@ -1345,6 +1348,7 @@
+                 file_states_tx,
+                 untracked_paths_tx,
+                 invalid_utf8_paths_tx,
++                ignored_paths_tx,
+                 deleted_files_tx,
+                 error: OnceLock::new(),
+                 progress: *progress,
+@@ -1368,6 +1372,7 @@
+         let stats = SnapshotStats {
+             untracked_paths: untracked_paths_rx.into_iter().collect(),
+             invalid_utf8_paths: invalid_utf8_paths_rx.into_iter().collect(),
++            ignored_paths: ignored_paths_rx.into_iter().collect::<BTreeSet<_>>(),
+         };
+         let mut tree_builder = MergedTreeBuilder::new(self.tree.clone());
+         trace_span!("process tree entries").in_scope(|| {
+@@ -1520,6 +1525,7 @@
+     file_states_tx: Sender<(RepoPathBuf, FileState)>,
+     untracked_paths_tx: Sender<(RepoPathBuf, UntrackedReason)>,
+     invalid_utf8_paths_tx: Sender<(RepoPathBuf, OsString)>,
++    ignored_paths_tx: Sender<IgnoredPath>,
+     deleted_files_tx: Sender<RepoPathBuf>,
+     error: OnceLock<SnapshotError>,
+     progress: Option<&'a SnapshotProgress<'a>>,
+@@ -1645,14 +1651,39 @@
+             if git_ignore.matches_dir(&path)
+                 && self.force_tracking_matcher.visit(&path).is_nothing()
+             {
+-                // If the whole directory is ignored by .gitignore, visit only
+-                // paths we're already tracking. This is because .gitignore in
+-                // ignored directory must be ignored. It's also more efficient.
+-                // start_tracking_matcher is NOT tested here because we need to
+-                // scan directory entries to report untracked paths.
+-                self.spawn_ok(scope, move |_| {
+-                    self.visit_tracked_files(file_states).block_on()
+-                });
++                if file_states.is_empty() {
++                    // No tracked files anywhere underneath this ignored
++                    // directory (this also covers the case where the
++                    // directory is completely empty on disk): report the
++                    // whole directory as a single ignored path instead of
++                    // walking into it. This keeps `ignored_paths` maximally
++                    // collapsed, consistent with how nested ignored
++                    // directories are reported in `visit_ignored_dir_entries`.
++                    self.ignored_paths_tx.send(IgnoredPath::dir(path)).ok();
++                } else {
++                    // If the whole directory is ignored by .gitignore, visit
++                    // all entries but report individual (new) files as
++                    // ignored instead of the whole directory. This is
++                    // because .gitignore in ignored directory must be
++                    // ignored. It's also more efficient to walk the
++                    // directory ourselves without re-interpreting
++                    // .gitignore.
++                    let ignored_dir = path.clone();
++                    let ignored_disk_dir = disk_dir.clone();
++                    self.spawn_ok(scope, move |scope| {
++                        async move {
++                            self.visit_tracked_files(file_states).await?;
++                            self.visit_ignored_dir_entries(
++                                &ignored_dir,
++                                &ignored_disk_dir,
++                                file_states,
++                                scope,
++                            )
++                            .await
++                        }
++                        .block_on()
++                    });
++                }
+             } else if !self.matcher.visit(&path).is_nothing() {
+                 let directory_to_visit = DirectoryToVisit {
+                     dir: path,
+@@ -1676,6 +1707,7 @@
+             {
+                 // If it wasn't already tracked and it matches
+                 // the ignored paths, then ignore it.
++                self.ignored_paths_tx.send(IgnoredPath::file(path)).ok();
+                 Ok(None)
+             } else if maybe_current_file_state.is_none()
+                 && !self.start_tracking_matcher.matches(&path)
+@@ -1760,6 +1792,80 @@
+         Ok(())
+     }
+ 
++    /// Visits entries in an ignored directory, reporting new (untracked) files
++    /// individually and subdirectories without tracked files as ignored paths.
++    /// Recurses into subdirectories that contain tracked files to find
++    /// individual ignored files. Does not re-interpret `.gitignore` files
++    /// inside the directory.
++    async fn visit_ignored_dir_entries<'scope>(
++        &'scope self,
++        dir: &RepoPath,
++        disk_dir: &Path,
++        file_states: FileStates<'scope>,
++        scope: &rayon::Scope<'scope>,
++    ) -> Result<(), SnapshotError> {
++        let dir_entries: Vec<_> = disk_dir
++            .read_dir()
++            .and_then(|entries| entries.try_collect())
++            .map_err(|err| SnapshotError::Other {
++                message: format!("Failed to read directory {}", disk_dir.display()),
++                err: err.into(),
++            })?;
++        if dir_entries.is_empty() {
++            // The directory has nothing left to recurse into (e.g. it was
++            // concurrently emptied). Report it directly instead of silently
++            // reporting nothing.
++            self.ignored_paths_tx.send(IgnoredPath::dir(dir.to_owned())).ok();
++            return Ok(());
++        }
++        for entry in &dir_entries {
++            let file_type = entry.file_type().unwrap();
++            let file_name = entry.file_name();
++            let Ok(name_string) = file_name.into_string() else {
++                // The path can't be represented as a RepoPath, so it can never
++                // be tracked. Since the whole directory is ignored, there's no
++                // need to report it either.
++                continue;
++            };
++            if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
++                continue;
++            }
++            let name = RepoPathComponent::new(&name_string).unwrap();
++            let path = dir.join(name);
++            if file_type.is_dir() {
++                let entry_disk_dir = entry.path();
++                if RESERVED_DIR_NAMES
++                    .iter()
++                    .any(|n| entry_disk_dir.join(n).symlink_metadata().is_ok())
++                {
++                    continue;
++                }
++                let child_file_states = file_states.prefixed_at(dir, name);
++                if child_file_states.is_empty() {
++                    // No tracked files underneath → report the directory itself
++                    self.ignored_paths_tx.send(IgnoredPath::dir(path)).ok();
++                } else {
++                    // Has tracked files → recurse to find individual ignored files
++                    let child_disk_dir = entry_disk_dir;
++                    self.spawn_ok(scope, move |scope| {
++                        self.visit_ignored_dir_entries(
++                            &path,
++                            &child_disk_dir,
++                            child_file_states,
++                            scope,
++                        )
++                        .block_on()
++                    });
++                }
++            } else if file_type.is_file()
++                && file_states.get_at(dir, name).is_none()
++            {
++                self.ignored_paths_tx.send(IgnoredPath::file(path)).ok();
++            }
++        }
++        Ok(())
++    }
++
+     async fn process_present_file(
+         &self,
+         path: RepoPathBuf,
+diff --git a/lib/src/working_copy.rs b/lib/src/working_copy.rs
+index 0d4317c19d..6e238c192b 100644
+--- a/lib/src/working_copy.rs
++++ b/lib/src/working_copy.rs
+@@ -238,6 +238,42 @@
+     /// as (directory, file name) pairs. These paths cannot be represented as
+     /// `RepoPath`s.
+     pub invalid_utf8_paths: BTreeSet<(RepoPathBuf, OsString)>,
++    /// List of paths that were ignored by .gitignore.
++    pub ignored_paths: BTreeSet<IgnoredPath>,
++}
++
++/// A path that was ignored by .gitignore, together with whether it refers to
++/// a directory or an individual file.
++///
++/// When `is_dir` is `true`, the directory (empty or not) has no tracked file
++/// anywhere underneath it, so the whole subtree should be treated as a single
++/// unit: e.g. shown as one collapsed entry, and removed as a whole with a
++/// single recursive delete.
++///
++/// `Ord`/`Eq` are derived from all fields, but in practice a given `path`
++/// will only ever appear once (as either a file or a directory), so ordering
++/// this set effectively sorts by `path`.
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub struct IgnoredPath {
++    /// The ignored path.
++    pub path: RepoPathBuf,
++    /// Whether the path is a directory.
++    pub is_dir: bool,
++}
++
++impl IgnoredPath {
++    /// Creates a new ignored path referring to a directory.
++    pub fn dir(path: RepoPathBuf) -> Self {
++        Self { path, is_dir: true }
++    }
++
++    /// Creates a new ignored path referring to a file.
++    pub fn file(path: RepoPathBuf) -> Self {
++        Self {
++            path,
++            is_dir: false,
++        }
++    }
+ }
+ 
+ /// Reason why the new path isn't tracked.
